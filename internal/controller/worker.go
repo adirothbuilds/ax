@@ -31,7 +31,12 @@ const (
 	// readRetryDelay is how long the worker waits after a transient error from the
 	// event queue before trying again.
 	readRetryDelay = time.Second
+	// Bound status-only retries so a storage failure cannot stall this worker indefinitely.
+	statusWriteAttempts   = 3
+	statusWriteRetryDelay = 500 * time.Millisecond
 )
+
+var errTaskStatusNotPersisted = errors.New("task status not persisted")
 
 // Worker consumes task events from the store's event queue and reconciles each
 // task against Substrate. Run several with the same group name to share the load;
@@ -62,8 +67,9 @@ func NewWorker(s store.Store, reconciler *TaskReconciler, group, consumer string
 }
 
 // Run subscribes to task events and processes them until ctx is done. It returns
-// ctx.Err() on shutdown; every event is acknowledged after processing, even when
-// reconciliation fails, so a bad task cannot wedge the queue.
+// ctx.Err() on shutdown. Reconciliation failures are acknowledged so a bad task
+// cannot wedge the queue. A successful reconciliation whose status cannot be
+// persisted is left unacknowledged after bounded status-only retries.
 func (w *Worker) Run(ctx context.Context) error {
 	slog.Info("starting AX task worker", "group", w.group, "consumer", w.consumer)
 
@@ -97,6 +103,12 @@ func (w *Worker) Run(ctx context.Context) error {
 				"action", ev.Action,
 				"error", err,
 			)
+			if errors.Is(err, errTaskStatusNotPersisted) {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				continue
+			}
 		}
 		if err := sub.Ack(ctx, ev); err != nil {
 			slog.Warn("failed to acknowledge task event", "id", ev.ID, "error", err)
@@ -155,9 +167,34 @@ func (w *Worker) processEvent(ctx context.Context, ev store.TaskEvent) error {
 		return fmt.Errorf("reconciling task %s/%s: %w", task.Metadata.Atespace, task.Metadata.Name, err)
 	}
 
-	if err := w.store.UpdateTaskStatus(ctx, task.Metadata.Atespace, task.Metadata.Name, reconciled.Status); err != nil {
-		return fmt.Errorf("updating task status %s/%s: %w", task.Metadata.Atespace, task.Metadata.Name, err)
+	if err := w.persistTaskStatus(ctx, reconciled); err != nil {
+		return fmt.Errorf("%w for %s/%s: %w", errTaskStatusNotPersisted, task.Metadata.Atespace, task.Metadata.Name, err)
 	}
 
 	return nil
+}
+
+// persistTaskStatus retries only the computed status, never the Substrate effects
+// of the successful reconciliation. Exhaustion leaves the event unacknowledged;
+// this worker does not replay pending events.
+func (w *Worker) persistTaskStatus(ctx context.Context, task *v1alpha1.Task) error {
+	var err error
+	for attempt := 1; attempt <= statusWriteAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		err = w.store.UpdateTaskStatus(ctx, task.Metadata.Atespace, task.Metadata.Name, task.Status)
+		if err == nil {
+			return nil
+		}
+		if attempt == statusWriteAttempts {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return errors.Join(err, ctx.Err())
+		case <-time.After(statusWriteRetryDelay):
+		}
+	}
+	return err
 }
